@@ -1,0 +1,19 @@
+# 🐍 Python bytecode and cache
+__pycache__/
+*.pyc
+
+# 🔒 Environment variables
+.env
+*.env
+
+# 🧪 Virtual environment
+venv/
+
+# 💻 System or IDE files (optional)
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 🚫 Log files
+*.log
