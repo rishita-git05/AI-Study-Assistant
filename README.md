@@ -60,4 +60,9 @@ GEMINI_API_KEY=your_actual_key_here
 
 ## 📜 License
 
-For educational use only. Please follow Google Gemini API terms of service.
+
+This project is licensed under the [Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International (CC BY-NC-ND 4.0)](https://creativecommons.org/licenses/by-nc-nd/4.0/) license.
+
+- ✅ Free to **view and share** for educational purposes.
+- ❌ **Commercial use**, **modification**, or **redistribution** of the code is **not allowed**.
+- ⚠️ You must also adhere to the [Google Gemini API Terms of Service](https://ai.google.dev/terms).
