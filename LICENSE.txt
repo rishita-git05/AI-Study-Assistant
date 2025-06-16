@@ -1,0 +1,12 @@
+Copyright (c) 2025 Rishita Chalumuri
+
+All rights reserved.
+
+This project is the intellectual property of the author.  
+No part of this codebase may be copied, reused, modified, or redistributed  
+without **explicit written permission** from the author.
+
+This code was submitted as part of a student internship project.  
+It is not intended for public use or commercial purposes.
+
+Violation may result in DMCA takedown or further action.
