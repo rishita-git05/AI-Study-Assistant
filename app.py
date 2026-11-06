@@ -1,32 +1,180 @@
+"""AI Study Assistant - RAG-Powered Gradio Application.
+
+Features:
+- Offline Ingestion & FAISS Vector Indexing with real-time status.
+- Genuine RAG Q&A with dense semantic retrieval, similarity thresholding, and deduplication.
+- Deterministic source page attribution.
+- Retrieval Inspection & Debug inspector displaying rank, chunk ID, page number, cosine similarity, and snippets.
+- Global document summarization with hierarchical map-reduce fallback.
+- Interactive multi-choice quiz generation with automated scoring.
+"""
+
+from typing import Tuple, List
 import gradio as gr
-from pdf_reader import extract_text_from_pdf
-from gemini_api import summarize_text, generate_quiz, parse_quiz, answer_question
+from rag.pipeline import RAGPipeline, RetrievalResult
+from rag.config import DEFAULT_TOP_K, SIMILARITY_THRESHOLD
+from gemini_api import (
+    generate_grounded_answer,
+    summarize_text,
+    generate_quiz,
+    parse_quiz
+)
 
-def process_pdf_summary(pdf_file):
-    text = extract_text_from_pdf(pdf_file)
-    if not text.strip():
+# Initialize application-level RAG Pipeline
+rag_pipeline = RAGPipeline()
+
+
+def handle_pdf_upload(pdf_file) -> str:
+    """Triggered whenever a user uploads or replaces a PDF document.
+    
+    Executes Stage 1 (Offline Ingestion & Indexing Pipeline).
+    """
+    if pdf_file is None:
+        rag_pipeline.clear()
+        return "📁 Please upload a PDF document to begin."
+
+    result = rag_pipeline.index_document(pdf_file)
+    if not result.get("success"):
+        return f"⚠️ **Indexing Failed:** {result.get('error')}"
+
+    return (
+        f"✅ **Document Indexed Successfully!**\n\n"
+        f"• **Pages Extracted:** {result['total_pages']}\n"
+        f"• **Text Chunks Created:** {result['total_chunks']}\n"
+        f"• **FAISS Vector Index:** {result['indexed_vectors']} dense vectors (384-dim, L2-normalized)\n\n"
+        f"_Ready for grounded RAG Q&A, summarization, and quiz generation._"
+    )
+
+
+def process_rag_question_answer(
+    pdf_file,
+    question: str,
+    top_k: int,
+    similarity_threshold: float
+) -> Tuple[str, str, str]:
+    """Executes Stage 2 (Online Query-Time RAG Pipeline).
+    
+    Query -> Dense Embedding -> FAISS Search -> Deduplication ->
+    Threshold Filter -> Grounded Gemini Generation -> Source Attribution.
+    """
+    if pdf_file is None:
+        return (
+            "⚠️ Please upload a PDF document before asking a question.",
+            "📌 **Sources:** None",
+            "No document indexed."
+        )
+
+    # If the document hasn't been indexed yet, index it first
+    if not rag_pipeline.is_indexed:
+        idx_res = rag_pipeline.index_document(pdf_file)
+        if not idx_res.get("success"):
+            return (
+                f"⚠️ Could not index document: {idx_res.get('error')}",
+                "📌 **Sources:** None",
+                "Indexing failed."
+            )
+
+    # 1. Semantic Retrieval with Deduplication & Thresholding
+    retrieval_result: RetrievalResult = rag_pipeline.retrieve(
+        query=question,
+        top_k=int(top_k),
+        similarity_threshold=float(similarity_threshold)
+    )
+
+    # 2. Build Debug Inspector Table
+    debug_markdown = _format_debug_table(retrieval_result, similarity_threshold)
+
+    # 3. Check if threshold filtering permitted generation
+    if not retrieval_result.has_sufficient_context:
+        answer_text = (
+            f"ℹ️ **No Sufficient Context Found**\n\n"
+            f"{retrieval_result.fallback_message}\n\n"
+            f"> *Note: No retrieved chunks met the similarity threshold of {similarity_threshold:.2f}. "
+            f"LLM generation was short-circuited to prevent hallucination.*"
+        )
+        sources_text = "📌 **Sources:** None (No chunks passed relevance threshold)"
+        return answer_text, sources_text, debug_markdown
+
+    # 4. Grounded Gemini Generation using ONLY retrieved context
+    grounded_answer = generate_grounded_answer(
+        context=retrieval_result.formatted_context,
+        question=question
+    )
+
+    # 5. Deterministic Source Attribution from Chunk Metadata
+    if retrieval_result.sources:
+        pages_str = ", ".join([f"Page {p}" for p in retrieval_result.sources])
+        sources_text = f"📌 **Sources:** {pages_str}"
+    else:
+        sources_text = "📌 **Sources:** Not specified"
+
+    return grounded_answer, sources_text, debug_markdown
+
+
+def _format_debug_table(result: RetrievalResult, threshold: float) -> str:
+    """Formats retrieved chunk diagnostic metadata into an inspection view."""
+    if not result.debug_chunks:
+        return "_No candidate chunks were retrieved._"
+
+    lines = [
+        "### 🔍 Retrieval Inspection & Diagnostics\n",
+        f"**Query:** *\"{result.query}\"* | **Threshold Cutoff:** `{threshold:.2f}`\n",
+        "| Rank | Chunk ID | Source Page | Cosine Similarity | Threshold Status | Chunk Text Snippet |",
+        "| :---: | :---: | :---: | :---: | :---: | :--- |"
+    ]
+
+    for c in result.debug_chunks:
+        status = "✅ Passed" if c.passed_threshold else "❌ Filtered Out"
+        clean_snippet = c.text.replace("\n", " ").replace("|", "\\|")
+        snippet = (clean_snippet[:100] + "...") if len(clean_snippet) > 100 else clean_snippet
+        lines.append(
+            f"| #{c.rank} | `{c.chunk_id}` | Page {c.page_number} | **{c.score:.4f}** | {status} | {snippet} |"
+        )
+
+    lines.append("\n> **Mathematical Rationale:**")
+    lines.append(
+        "> All vectors are L2-normalized ($\\|\\mathbf{v}\\|_2 = 1.0$), so the FAISS `IndexFlatIP` "
+        "inner product is mathematically identical to **Cosine Similarity**: "
+        "$\\mathbf{u} \\cdot \\mathbf{v} = \\cos(\\theta)$."
+    )
+
+    return "\n".join(lines)
+
+
+def process_pdf_summary(pdf_file) -> str:
+    """Generates document summary with hierarchical map-reduce fallback."""
+    if pdf_file is None:
+        return "Please upload a valid PDF document."
+
+    if not rag_pipeline.is_indexed:
+        rag_pipeline.index_document(pdf_file)
+
+    full_text = rag_pipeline.get_document_full_text()
+    if not full_text.strip():
         return "No valid text found in the PDF."
-    return summarize_text(text)
 
-def process_pdf_quiz(pdf_file):
-    text = extract_text_from_pdf(pdf_file)
-    if not text.strip():
-        return "No valid text found in the PDF."
-    return generate_quiz(text)
+    return summarize_text(full_text)
 
-def process_question_answer(pdf_file, question):
-    context = extract_text_from_pdf(pdf_file)
-    if not context.strip():
-        return "No valid text found in the PDF."
-    return answer_question(context, question)
 
-def generate_and_parse_quiz(pdf_file):
-    text = extract_text_from_pdf(pdf_file)
-    quiz_text = generate_quiz(text)
+def generate_and_parse_quiz(pdf_file) -> Tuple[str, List[dict]]:
+    """Generates and parses interactive multiple-choice quiz."""
+    if pdf_file is None:
+        return "Please upload a valid PDF document.", []
+
+    if not rag_pipeline.is_indexed:
+        rag_pipeline.index_document(pdf_file)
+
+    full_text = rag_pipeline.get_document_full_text()
+    if not full_text.strip():
+        return "No valid text found in the PDF.", []
+
+    quiz_text = generate_quiz(full_text)
     parsed = parse_quiz(quiz_text)
     return quiz_text, parsed
 
+
 def check_all_answers(q1, q2, q3, parsed):
+    """Scores quiz selections against parsed ground truth."""
     user_answers = [q1, q2, q3]
     score = 0
     feedback = []
@@ -43,12 +191,13 @@ def check_all_answers(q1, q2, q3, parsed):
             feedback.append(f"✅ Correct!\n\n**Explanation:** {explanation}")
             score += 1
         else:
-            correct_option = q["options"][correct_idx]
-            feedback.append(f"❌ Incorrect. Correct answer: {correct_letter}) \n\n**Explanation:** {explanation}")
+            feedback.append(
+                f"❌ Incorrect. Correct answer: {correct_letter}) \n\n**Explanation:** {explanation}"
+            )
 
     while len(feedback) < 3:
         feedback.append("")
-        user_answers[len(feedback)-1] = None
+        user_answers[len(feedback) - 1] = None
 
     return (
         [gr.update(value=fb, visible=(i < len(parsed))) for i, fb in enumerate(feedback)] +
@@ -56,6 +205,11 @@ def check_all_answers(q1, q2, q3, parsed):
         [gr.update(interactive=False, visible=(i < len(parsed))) for i in range(3)] +
         [gr.update(value=f"**Your score: {score}/{len(parsed)}**", visible=True)]
     )
+
+
+# ============================================================================
+# Gradio UI Design
+# ============================================================================
 
 adaptive_css = """
 :root {
@@ -65,17 +219,9 @@ adaptive_css = """
   --tertiary: #3b82f6;
   --accent: #f59e0b;
   --error: #ef4444;
-  
-  /* Text */
-  --text-primary: #1f2937;
-  --text-secondary: #4b5563;
-  
-  /* Backgrounds */
   --bg-surface: #f9fafb;
   --bg-alt: #f3f4f6;
   --bg-input: white;
-  
-  /* Borders */
   --border-light: rgba(0, 0, 0, 0.1);
   --border-medium: rgba(0, 0, 0, 0.15);
 }
@@ -86,22 +232,14 @@ adaptive_css = """
   --secondary: #2dd4bf;
   --tertiary: #60a5fa;
   --accent: #fbbf24;
-  
-  /* Text */
-  --text-primary: #f9fafb;
-  --text-secondary: #d1d5db;
-  
-  /* Backgrounds */
   --bg-surface: #111827;
   --bg-alt: #1f2937;
   --bg-input: #1a2536;
-  
-  /* Borders */
   --border-light: rgba(255, 255, 255, 0.1);
   --border-medium: rgba(255, 255, 255, 0.15);
 }
 
-.header > div:first-child{
+.header > div:first-child {
   font-size: 2.5rem;
   background: linear-gradient(45deg, var(--primary), var(--tertiary));
   -webkit-background-clip: text;
@@ -111,6 +249,7 @@ adaptive_css = """
   padding-bottom: 10px;
   margin-bottom: 0.3rem;
 }
+
 .header > div:first-child::after {
   content: "";
   position: absolute;
@@ -126,20 +265,19 @@ adaptive_css = """
   border-bottom: none !important;
   gap: 5px;
 }
+
 .tab-item {
   padding: 12px 20px !important;
   border-radius: 12px 12px 0 0 !important;
   transition: all 0.3s ease !important;
 }
+
 .tab-item.selected {
   background: var(--bg-alt) !important;
   color: var(--primary) !important;
   font-weight: 600;
   box-shadow: 0 -3px 0 var(--primary) inset,
               0 2px 10px rgba(0,0,0,0.1);
-}
-.tab-item:not(.selected):hover {
-  color: var(--tertiary) !important;
 }
 
 .btn-summary, .btn-quiz, .btn-qa {
@@ -149,153 +287,143 @@ adaptive_css = """
   box-shadow: 0 4px 6px rgba(0,0,0,0.1) !important;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
 }
+
 .btn-summary {
   background: linear-gradient(135deg, var(--primary), var(--primary-light)) !important;
 }
+
 .btn-quiz {
   background: linear-gradient(135deg, var(--secondary), #6ee7b7) !important;
 }
+
 .btn-qa {
   background: linear-gradient(135deg, var(--tertiary), #93c5fd) !important;
 }
-.btn-summary:hover {
+
+.btn-summary:hover, .btn-quiz:hover, .btn-qa:hover {
   transform: translateY(-2px);
-  box-shadow: 0 7px 14px color-mix(in srgb, var(--primary), transparent 60%) !important;
-}
-.btn-quiz:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 7px 14px color-mix(in srgb, var(--secondary), transparent 60%) !important;
-}
-.btn-qa:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 7px 14px color-mix(in srgb, var(--tertiary), transparent 60%) !important;
 }
 
 .file-upload {
   border: 2px dashed var(--border-light) !important;
   background: var(--bg-alt) !important;
-  position: relative;
-  transition: all 0.3s ease !important;
-  cursor: pointer;
-}
-.file-upload:hover {
-  border-color: var(--primary) !important;
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary), transparent 80%);
-}
-.file-upload::before {
-  content: "";
-  position: absolute;
-  top: -50%;
-  left: -50%;
-  width: 200%;
-  height: 200%;
-  background: 
-    repeating-linear-gradient(
-      45deg,
-      transparent,
-      transparent 7px,
-      color-mix(in srgb, var(--primary), transparent 70%) 7px,
-      transparent 14px
-    );
-  opacity: 0;
-  transition: opacity 0.3s ease;
-  pointer-events: none;
-}
-.file-upload:hover::before {
-  opacity: 0.2;
-  animation: moveDots 3s linear infinite;
-}
-@keyframes moveDots {
-  to { background-position: 14px 14px; }
+  border-radius: 12px !important;
 }
 
-input[type="text"], textarea, .dropdown {
-  background: var(--bg-input) !important;
-  border: 2px solid var(--border-medium) !important;
-  padding: 12px 16px !important;
+.status-box {
+  background: var(--bg-surface) !important;
+  border: 1px solid var(--border-medium) !important;
   border-radius: 8px !important;
-}
-input[type="text"]:focus, textarea:focus {
-  border-color: var(--tertiary) !important;
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--tertiary), transparent 80%) !important;
+  padding: 12px !important;
+  font-size: 0.9rem;
 }
 
-.output-box, .output-box *, .output-box.prose {
-  border: none !important;
-  box-shadow: none !important;
+.source-badge {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--primary);
+  background: var(--bg-alt);
+  padding: 8px 14px;
+  border-radius: 8px;
+  border-left: 4px solid var(--primary);
+  margin-bottom: 10px;
 }
 
 .output-box {
-  min-height: 220px;
+  min-height: 180px;
   background: var(--bg-surface) !important;
   border-radius: 12px !important;
-  border: 2px solid var(--primary) !important;
-  position: relative;
-  overflow: hidden;
-  padding: 5px !important;
-}
-
-input[type="radio"] {
-  border: 2px solid var(--border-light) !important;
-  border-radius: 12px !important;
-  padding: 12px 16px !important;
-  margin: 8px 0 !important;
-  transition: all 0.2s ease !important;
-}
-input[type="radio"]:hover {
-  border-color: var(--tertiary) !important;
-}
-input[type="radio"]:checked + span {
-  background: color-mix(in srgb, var(--tertiary), transparent 90%) !important;
-  border-color: var(--tertiary) !important;
-}
-
-[data-testid="markdown"]:has(> .feedback) {
-  padding: 1rem !important;
-  border-radius: 8px !important;
-  animation: fadeIn 0.5s ease;
-}
-@keyframes fadeIn {
-  from { opacity: 0; transform: translateY(5px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-.feedback.correct {
-  background: color-mix(in srgb, var(--secondary), transparent 85%) !important;
-  border-left: 4px solid var(--secondary) !important;
-}
-.feedback.incorrect {
-  background: color-mix(in srgb, var(--error), transparent 85%) !important;
-  border-left: 4px solid var(--error) !important;
+  border: 2px solid var(--border-medium) !important;
+  padding: 12px !important;
 }
 """
 
 with gr.Blocks(theme=gr.themes.Soft(), css=adaptive_css) as demo:
     with gr.Column(elem_classes=["header"]):
-        gr.Markdown("# 📚 AI Study Assistant")
-        gr.Markdown("Gemini-powered learning tools")
+        gr.Markdown("# 📚 AI Study Assistant (RAG Engine)")
+        gr.Markdown("Dense Semantic Retrieval with FAISS & Grounded Gemini Generation")
 
     with gr.Row():
-        with gr.Column(scale=1, min_width=280):
-            gr.Markdown("### Your Document")
-            pdf_file = gr.File(label="Upload PDF",elem_classes=["file-upload"], file_types=[".pdf"])
+        with gr.Column(scale=1, min_width=300):
+            gr.Markdown("### 📄 Document Ingestion")
+            pdf_file = gr.File(
+                label="Upload Study PDF",
+                elem_classes=["file-upload"],
+                file_types=[".pdf"]
+            )
+            doc_status = gr.Markdown(
+                "📁 Upload a PDF to trigger indexing.",
+                elem_classes=["status-box"]
+            )
+            pdf_file.change(fn=handle_pdf_upload, inputs=pdf_file, outputs=doc_status)
 
         with gr.Column(scale=3):
             with gr.Tabs():
-                with gr.Tab("📝 Summary", elem_classes=["tab-item"]):
-                    summarize_btn = gr.Button("✨ Summarize", elem_classes=["btn-summary"])
-                    gr.Markdown("#### Document Summary")
-                    summary_output = gr.Markdown(elem_classes=["output-box"])
-                    summarize_btn.click(fn=process_pdf_summary, inputs=pdf_file, outputs=summary_output)
+                # TAB 1: RAG Q&A
+                with gr.Tab("❓ Grounded Q&A (RAG)", elem_classes=["tab-item"]):
+                    gr.Markdown("#### Semantic Retrieval & Grounded Answering")
+                    question_input = gr.Textbox(
+                        label="Your Question",
+                        placeholder="Ask a factual question about the uploaded document...",
+                        lines=2
+                    )
 
-                with gr.Tab("🧠 Quiz", elem_classes=["tab-item"]):
+                    with gr.Row():
+                        top_k_slider = gr.Slider(
+                            minimum=1,
+                            maximum=8,
+                            value=DEFAULT_TOP_K,
+                            step=1,
+                            label="Top-k Chunks Retrieved",
+                            info="Number of nearest chunks retrieved from FAISS"
+                        )
+                        threshold_slider = gr.Slider(
+                            minimum=0.10,
+                            maximum=0.80,
+                            value=SIMILARITY_THRESHOLD,
+                            step=0.05,
+                            label="Similarity Threshold",
+                            info="Minimum Cosine Similarity cutoff to prevent hallucination"
+                        )
+
+                    answer_btn = gr.Button("🧐 Ask with RAG", elem_classes=["btn-qa"])
+
+                    gr.Markdown("#### Grounded Answer")
+                    source_output = gr.Markdown(
+                        "📌 **Sources:** No query processed yet.",
+                        elem_classes=["source-badge"]
+                    )
+                    answer_output = gr.Markdown(elem_classes=["output-box"])
+
+                    with gr.Accordion("🔍 Inspect Retrieved Chunks & Similarity Scores (RAG Debugger)", open=False):
+                        debug_output = gr.Markdown("_Submit a question to inspect retrieved FAISS chunks._")
+
+                    answer_btn.click(
+                        fn=process_rag_question_answer,
+                        inputs=[pdf_file, question_input, top_k_slider, threshold_slider],
+                        outputs=[answer_output, source_output, debug_output]
+                    )
+
+                # TAB 2: Document Summary
+                with gr.Tab("📝 Summary", elem_classes=["tab-item"]):
+                    gr.Markdown("#### Global Document Synthesis")
+                    summarize_btn = gr.Button("✨ Summarize Document", elem_classes=["btn-summary"])
+                    summary_output = gr.Markdown(elem_classes=["output-box"])
+                    summarize_btn.click(
+                        fn=process_pdf_summary,
+                        inputs=pdf_file,
+                        outputs=summary_output
+                    )
+
+                # TAB 3: Quiz Generation
+                with gr.Tab("🧠 Interactive Quiz", elem_classes=["tab-item"]):
+                    gr.Markdown("#### Knowledge Check")
                     num_questions_dropdown = gr.Dropdown(
                         choices=["1", "2", "3"],
                         value="3",
                         label="Select number of questions",
-                        interactive=True,
-                        elem_classes=["dropdown"]
+                        interactive=True
                     )
-
                     quiz_btn = gr.Button("🧠 Generate Quiz", elem_classes=["btn-quiz"])
                     quiz_text_output = gr.Textbox(label="Generated Quiz (raw)", visible=False)
 
@@ -308,47 +436,50 @@ with gr.Blocks(theme=gr.themes.Soft(), css=adaptive_css) as demo:
 
                     for _ in range(3):
                         question_md = gr.Markdown(visible=False)
-                        radio = gr.Radio(choices=[], label="Choose", type="index", interactive=True, visible=False)
-                        feedback = gr.Markdown(label="✅ Result", visible=False, elem_classes=["feedback"])
+                        radio = gr.Radio(
+                            choices=[],
+                            label="Choose",
+                            type="index",
+                            interactive=True,
+                            visible=False
+                        )
+                        feedback = gr.Markdown(visible=False)
                         quiz_question_boxes.append(question_md)
                         quiz_radio_boxes.append(radio)
                         quiz_feedback_boxes.append(feedback)
 
                     quiz_submit = gr.Button("✅ Submit All Answers", visible=False)
-
                     is_quiz_generated = gr.State(False)
 
-                    def quiz_handler(pdf_file, num_q):
-                      raw, parsed = generate_and_parse_quiz(pdf_file)
-                      n = int(num_q)
-                      parsed = parsed[:n]
-                      
-                      question_updates, radio_updates, feedback_updates = [], [], []
+                    def quiz_handler(pdf, num_q):
+                        raw, parsed = generate_and_parse_quiz(pdf)
+                        n = int(num_q)
+                        parsed = parsed[:n]
 
-                      for i in range(3):
-                          if i < len(parsed):
-                              q = parsed[i]
-                              question_updates.append(gr.update(value=f"*Q{i+1}. {q['question']}*", visible=True))
-                              radio_updates.append(gr.update(choices=q["options"], value=None, visible=True, interactive=True))
-                              feedback_updates.append(gr.update(value="", visible=False))
-                          else:
-                              question_updates.append(gr.update(visible=False))
-                              radio_updates.append(gr.update(visible=False))
-                              feedback_updates.append(gr.update(visible=False))
+                        q_updates, r_updates, fb_updates = [], [], []
+                        for i in range(3):
+                            if i < len(parsed):
+                                q = parsed[i]
+                                q_updates.append(gr.update(value=f"*Q{i+1}. {q['question']}*", visible=True))
+                                r_updates.append(gr.update(choices=q["options"], value=None, visible=True, interactive=True))
+                                fb_updates.append(gr.update(value="", visible=False))
+                            else:
+                                q_updates.append(gr.update(visible=False))
+                                r_updates.append(gr.update(visible=False))
+                                fb_updates.append(gr.update(visible=False))
 
-                      return [
-                          raw,
-                          parsed[:n],
-                          False,
-                          True,
-                      ] + question_updates + radio_updates + feedback_updates + [
-                          gr.update(visible=True),
-                          gr.update(visible=False)
-                      ]
+                        return [
+                            raw,
+                            parsed[:n],
+                            False,
+                            True
+                        ] + q_updates + r_updates + fb_updates + [
+                            gr.update(visible=True),
+                            gr.update(visible=False)
+                        ]
 
-
-                    def toggle_button(is_generated):
-                        return gr.update(value="🔁 Retake Quiz" if is_generated else "🧠 Generate Quiz")
+                    def toggle_button(is_gen):
+                        return gr.update(value="🔁 Retake Quiz" if is_gen else "🧠 Generate Quiz")
 
                     quiz_btn.click(
                         fn=quiz_handler,
@@ -369,11 +500,6 @@ with gr.Blocks(theme=gr.themes.Soft(), css=adaptive_css) as demo:
                         inputs=quiz_radio_boxes + [parsed_quiz_data],
                         outputs=quiz_feedback_boxes + [quiz_submitted] + quiz_radio_boxes + [quiz_score_output]
                     )
-                with gr.Tab("❓ Q&A", elem_classes=["tab-item"]):
-                    question_input = gr.Textbox(label="Your Question", placeholder="Type your question here...")
-                    answer_btn = gr.Button("🧐 Get Answer", elem_classes=["btn-qa"])
-                    gr.Markdown("#### Answer")
-                    answer_output = gr.Markdown(elem_classes=["output-box"])
-                    answer_btn.click(fn=process_question_answer, inputs=[pdf_file, question_input], outputs=answer_output)
 
-demo.launch()
+if __name__ == "__main__":
+    demo.launch()
